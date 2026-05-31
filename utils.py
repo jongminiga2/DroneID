@@ -1,6 +1,6 @@
 import numpy as np
 import os
-from typing import Tuple
+from typing import Tuple, Dict, Any
 
 
 def get_fft_size(sample_rate: float) -> int:
@@ -21,6 +21,48 @@ def get_data_carrier_indices(sample_rate: float) -> np.ndarray:
     mapping[dc_idx - data_carrier_count // 2 : dc_idx] = 1
     mapping[dc_idx + 1 : dc_idx + data_carrier_count // 2 + 1] = 1
     return np.where(mapping == 1)[0]
+
+
+def get_frame_structure(sample_rate: float, legacy: bool = False) -> Dict[str, Any]:
+    """OFDM frame layout for DroneID.
+
+    Modern (post-Mavic 2): 9 OFDM symbols, ZC at 0-based indices [3, 5],
+    symbol 0 carries a known Gold sequence and is excluded from payload.
+
+    Legacy (Mavic Pro / Mavic 2): 8 OFDM symbols (symbol 0 missing in tx),
+    ZC at 0-based indices [2, 4]. All non-ZC symbols carry payload data.
+    """
+    long_cp_len, short_cp_len = get_cyclic_prefix_lengths(sample_rate)
+
+    if legacy:
+        cp_schedule = np.array([
+            long_cp_len,
+            short_cp_len, short_cp_len, short_cp_len,
+            short_cp_len, short_cp_len, short_cp_len,
+            long_cp_len,
+        ])
+        zc_symbol_indices = (2, 4)
+        data_symbol_indices = [0, 1, 3, 5, 6, 7]
+    else:
+        cp_schedule = np.array([
+            long_cp_len,
+            short_cp_len, short_cp_len, short_cp_len,
+            short_cp_len, short_cp_len, short_cp_len,
+            short_cp_len,
+            long_cp_len,
+        ])
+        zc_symbol_indices = (3, 5)
+        data_symbol_indices = [1, 2, 4, 6, 7, 8]
+
+    return {
+        'cp_schedule': cp_schedule,
+        'num_symbols': len(cp_schedule),
+        'zc_symbol_indices': zc_symbol_indices,
+        'data_symbol_indices': data_symbol_indices,
+        'long_cp_len': long_cp_len,
+        'short_cp_len': short_cp_len,
+        'legacy': legacy,
+    }
 
 
 _BYTES_PER_SAMPLE = {
@@ -50,6 +92,22 @@ def get_bytes_per_sample(sample_type: str) -> int:
 def get_sample_count_of_file(file_path: str, sample_type: str) -> int:
     bps = get_bytes_per_sample(sample_type)
     return os.path.getsize(file_path) // bps // 2
+
+
+def with_sample_offset(data: np.ndarray, offset: float) -> np.ndarray:
+    """Shift complex samples by a fractional offset via linear interpolation.
+
+    Ports DroneDetection's helpers.with_sample_offset. Equivalent to taking
+    data at indices [offset, offset+1, ..., offset+len-1]; values outside the
+    original range are extrapolated by numpy.interp's edge-clamp behaviour.
+    """
+    n = len(data)
+    x_new = np.arange(offset, offset + n)
+    x_old = np.arange(n)
+    if np.iscomplexobj(data):
+        return (np.interp(x_new, x_old, data.real)
+                + 1j * np.interp(x_new, x_old, data.imag))
+    return np.interp(x_new, x_old, data)
 
 
 def read_complex(file_path: str, sample_offset: int, sample_count: int,

@@ -1,5 +1,5 @@
 import numpy as np
-from utils import (get_fft_size, get_cyclic_prefix_lengths,
+from utils import (get_fft_size, get_frame_structure,
                    get_sample_count_of_file, read_complex)
 from correlator import find_zc_indices_by_file
 
@@ -8,7 +8,8 @@ def extract_bursts_from_file(input_path: str, sample_rate: float,
                               frequency_offset: float,
                               correlation_threshold: float,
                               chunk_size: int, padding: int,
-                              sample_type: str = 'single') -> np.ndarray:
+                              sample_type: str = 'single',
+                              legacy: bool = False) -> np.ndarray:
     """Extract all DroneID bursts from a raw IQ recording.
 
     Replicates MATLAB's extract_bursts_from_file.m.
@@ -33,21 +34,22 @@ def extract_bursts_from_file(input_path: str, sample_rate: float,
     num_samples = get_sample_count_of_file(input_path, sample_type)
 
     fft_size = get_fft_size(sample_rate)
-    long_cp_len, short_cp_len = get_cyclic_prefix_lengths(sample_rate)
+    structure = get_frame_structure(sample_rate, legacy=legacy)
+    cp_schedule = structure['cp_schedule']
+    num_symbols = structure['num_symbols']
+    zc1_idx = structure['zc_symbol_indices'][0]
 
     freq_offset_constant = 1j * np.pi * 2.0 * (frequency_offset / sample_rate)
 
-    # The ZC correlator returns the index of the first sample *after* the ZC
-    # symbol (i.e. the start of OFDM symbol 5's CP).  Back off to the true
-    # start of the burst:  3 FFT windows + long_cp + 3 short_cps before that.
-    zc_seq_offset = (fft_size * 3) + long_cp_len + (short_cp_len * 3)
+    # Back off from the first ZC peak to the burst start: sum of CPs+FFTs of
+    # all symbols before the first ZC, plus the first ZC's own CP.
+    zc_seq_offset = int(cp_schedule[:zc1_idx + 1].sum()) + fft_size * zc1_idx
 
     indices = find_zc_indices_by_file(
         input_path, sample_rate, frequency_offset,
         correlation_threshold, chunk_size, sample_type=sample_type)
 
-    # 9 OFDM symbols: 2 long CPs, 7 short CPs
-    burst_sample_count = (padding * 2) + (long_cp_len * 2) + (short_cp_len * 7) + (fft_size * 9)
+    burst_sample_count = (padding * 2) + int(cp_schedule.sum()) + (fft_size * num_symbols)
 
     # Pre-compute frequency-offset correction vector (same for every burst)
     freq_offset_vec = np.exp(freq_offset_constant * np.arange(1, burst_sample_count + 1))

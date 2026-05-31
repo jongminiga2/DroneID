@@ -1,8 +1,9 @@
 import numpy as np
-from utils import get_fft_size, get_cyclic_prefix_lengths
+from utils import get_fft_size, get_frame_structure
 
 
-def find_sto_cp(samples: np.ndarray, sample_rate: float) -> int:
+def find_sto_cp(samples: np.ndarray, sample_rate: float,
+                legacy: bool = False) -> int:
     """Estimate the burst start offset using cyclic-prefix correlation.
 
     Replicates MATLAB's find_sto_cp.m.
@@ -14,21 +15,15 @@ def find_sto_cp(samples: np.ndarray, sample_rate: float) -> int:
     Args:
         samples: Complex IQ burst samples (first sample near but before CP1).
         sample_rate: Sample rate of the provided samples in Hz.
+        legacy: If True, use 8-symbol Mavic Pro / Mavic 2 frame layout.
 
     Returns:
         0-based index of the first sample of CP1.
     """
-    long_cp_len, short_cp_len = get_cyclic_prefix_lengths(sample_rate)
     fft_size = get_fft_size(sample_rate)
-
-    cp_schedule = np.array([
-        long_cp_len,
-        short_cp_len, short_cp_len, short_cp_len,
-        short_cp_len, short_cp_len, short_cp_len,
-        short_cp_len,
-        long_cp_len,
-    ])
-    num_symbols = len(cp_schedule)
+    structure = get_frame_structure(sample_rate, legacy=legacy)
+    cp_schedule = structure['cp_schedule']
+    num_symbols = structure['num_symbols']
     full_burst_len = int(cp_schedule.sum()) + fft_size * num_symbols
     num_tests = len(samples) - full_burst_len
 
@@ -44,7 +39,11 @@ def find_sto_cp(samples: np.ndarray, sample_rate: float) -> int:
             # Magnitude of zero-lag cross-correlation between CP and symbol tail
             scores[sym_idx] = abs(np.dot(left, right.conj()))
             offset += fft_size + cp_len
-        # Skip first symbol (may be absent on some drones); average the rest
-        scores_cp_sto[test_idx] = scores[1:].sum() / (num_symbols - 1)
+        if legacy:
+            # Mavic 2 transmits all 8 symbols; include every one in the average.
+            scores_cp_sto[test_idx] = scores.sum() / num_symbols
+        else:
+            # Modern: symbol 0 may be absent on some drones; average the rest.
+            scores_cp_sto[test_idx] = scores[1:].sum() / (num_symbols - 1)
 
     return int(np.argmax(scores_cp_sto))

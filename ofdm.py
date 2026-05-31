@@ -1,10 +1,11 @@
 import numpy as np
 from typing import Tuple
-from utils import get_fft_size, get_cyclic_prefix_lengths
+from utils import get_fft_size, get_frame_structure
 
 
 def extract_ofdm_symbol_samples(samples: np.ndarray,
-                                 sample_rate: float
+                                 sample_rate: float,
+                                 legacy: bool = False,
                                  ) -> Tuple[np.ndarray, np.ndarray]:
     """Strip cyclic prefixes and return time- and frequency-domain symbols.
 
@@ -13,23 +14,16 @@ def extract_ofdm_symbol_samples(samples: np.ndarray,
     Args:
         samples: Time-domain burst starting exactly at the first CP sample.
         sample_rate: Sample rate in Hz.
+        legacy: If True, use 8-symbol Mavic Pro / Mavic 2 frame layout.
 
     Returns:
-        time_domain:  (9, fft_size) complex array of time-domain symbol data.
-        freq_domain:  (9, fft_size) complex array after fftshift(fft(...)).
+        time_domain:  (num_symbols, fft_size) complex array of time-domain symbol data.
+        freq_domain:  (num_symbols, fft_size) complex array after fftshift(fft(...)).
     """
     fft_size = get_fft_size(sample_rate)
-    long_cp_len, short_cp_len = get_cyclic_prefix_lengths(sample_rate)
-
-    cp_lengths = np.array([
-        long_cp_len,
-        short_cp_len, short_cp_len, short_cp_len,
-        short_cp_len, short_cp_len, short_cp_len,
-        short_cp_len,
-        long_cp_len,
-    ])
-
-    num_symbols = len(cp_lengths)
+    structure = get_frame_structure(sample_rate, legacy=legacy)
+    cp_lengths = structure['cp_schedule']
+    num_symbols = structure['num_symbols']
     time_domain = np.zeros((num_symbols, fft_size), dtype=complex)
     freq_domain = np.zeros((num_symbols, fft_size), dtype=complex)
 

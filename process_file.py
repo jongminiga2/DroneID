@@ -32,13 +32,15 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from utils import get_fft_size, get_cyclic_prefix_lengths, get_data_carrier_indices
+from utils import (get_fft_size, get_data_carrier_indices,
+                   get_frame_structure, with_sample_offset)
 from burst_extractor import extract_bursts_from_file
 from timing import find_sto_cp
 from ofdm import extract_ofdm_symbol_samples
 from channel import calculate_channel
 from demod import quantize_qpsk
 from scrambler import generate_scrambler_seq
+from fine_timing import find_zc_offset, find_zc_angle
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +66,19 @@ def parse_args() -> argparse.Namespace:
                    help="Disable frequency-domain equalizer")
     p.add_argument("--no-plots", action="store_true",
                    help="Disable matplotlib plots")
+    p.add_argument("--legacy", action="store_true",
+                   help="Decode legacy 8-symbol frame (Mavic Pro / Mavic 2)")
+    p.add_argument("--fine-timing", action="store_true",
+                   help="Enable sub-sample timing search (find_zc_offset)")
+    p.add_argument("--fine-angle", action="store_true",
+                   help="Enable ZC DC-bin phase correction (find_zc_angle)")
+    p.add_argument("--ifo", action="store_true",
+                   help="Enable upsampled IFO frequency-offset step "
+                        "(off by default — the 10× round-trip can corrupt "
+                        "timing at high sample rates; use only when "
+                        "--target-freq is off by >7.5 kHz)")
+    p.add_argument("--no-lpf", action="store_true",
+                   help="Skip the low-pass filter step")
     return p.parse_args()
 
 
@@ -99,6 +114,7 @@ def main() -> None:
     chunk_size = args.chunk_size
     enable_equalizer = not args.no_equalizer
     enable_plots = not args.no_plots
+    legacy = args.legacy
 
     # ------------------------------------------------------------------
     # Low-pass filter (matches MATLAB's fir1(50, 10e6/fs))
@@ -112,14 +128,16 @@ def main() -> None:
     # OFDM structure constants
     # ------------------------------------------------------------------
     fft_size = get_fft_size(file_sample_rate)
-    long_cp_len, short_cp_len = get_cyclic_prefix_lengths(file_sample_rate)
-    cp_schedule = np.array([
-        long_cp_len,
-        short_cp_len, short_cp_len, short_cp_len,
-        short_cp_len, short_cp_len, short_cp_len,
-        short_cp_len,
-        long_cp_len,
-    ])
+    structure = get_frame_structure(file_sample_rate, legacy=legacy)
+    cp_schedule = structure['cp_schedule']
+    num_symbols = structure['num_symbols']
+    long_cp_len = structure['long_cp_len']
+    short_cp_len = structure['short_cp_len']
+    zc1_idx, zc2_idx = structure['zc_symbol_indices']
+    data_symbol_indices = structure['data_symbol_indices']
+
+    print(f"Frame layout: {'legacy (8 sym)' if legacy else 'modern (9 sym)'}, "
+          f"ZC at 0-based indices {zc1_idx},{zc2_idx}")
 
     # ------------------------------------------------------------------
     # Burst extraction
@@ -128,7 +146,8 @@ def main() -> None:
         file_path, file_sample_rate, file_freq_offset,
         correlation_threshold, chunk_size,
         padding=filter_tap_count,
-        sample_type=sample_type)
+        sample_type=sample_type,
+        legacy=legacy)
 
     if bursts.shape[0] == 0:
         sys.exit("[ERROR] No bursts found in the recording.")
@@ -159,56 +178,57 @@ def main() -> None:
         # --------------------------------------------------------------
         # Integer frequency offset (IFO) estimation via upsampled ZC
         # --------------------------------------------------------------
-        # Index of the first data sample of OFDM symbol 4 (the first ZC),
+        # Index of the first data sample of the first ZC symbol,
         # accounting for the filter_tap_count padding at the burst head.
-        # (Same calculation as MATLAB: sum(cp_schedule[0:4]) + fft_size*3 + filter_tap_count)
-        ifo_offset = int(cp_schedule[:4].sum()) + fft_size * 3 + filter_tap_count
+        ifo_offset = (int(cp_schedule[:zc1_idx + 1].sum())
+                      + fft_size * zc1_idx + filter_tap_count)
 
-        interp_rate = 10
-        burst = resample_poly(burst, interp_rate, 1)
+        if args.ifo:
+            interp_rate = 10
+            burst = resample_poly(burst, interp_rate, 1)
 
-        # Extract the upsampled ZC symbol data (no CP)
-        # MATLAB: burst(offset*interp_rate : offset*interp_rate + fft_size*interp_rate - 1)
-        # Python (0-indexed): burst[offset*interp_rate - 1 : offset*interp_rate - 1 + fft_size*interp_rate]
-        zc_start = ifo_offset * interp_rate - 1
-        zc_samples = burst[zc_start : zc_start + fft_size * interp_rate]
+            # Extract the upsampled ZC symbol data (no CP)
+            zc_start = ifo_offset * interp_rate - 1
+            zc_samples = burst[zc_start : zc_start + fft_size * interp_rate]
 
-        fft_bins = 10 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(zc_samples))) ** 2 + 1e-30)
+            fft_bins = 10 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(zc_samples))) ** 2 + 1e-30)
 
-        # Search ±15 bins around DC for the null (DC carrier)
-        bin_count = 15
-        center = len(fft_bins) // 2
-        search = fft_bins.copy()
-        search[: center - bin_count] = np.inf
-        search[center + bin_count :] = np.inf
-        center_offset = int(np.argmin(search))
+            # Search ±15 bins around DC for the null (DC carrier)
+            bin_count = 15
+            center = len(fft_bins) // 2
+            search = fft_bins.copy()
+            search[: center - bin_count] = np.inf
+            search[center + bin_count :] = np.inf
+            center_offset = int(np.argmin(search))
 
-        integer_offset_hz = (center - center_offset) * 15e3
-        radians = 2 * np.pi * integer_offset_hz / (file_sample_rate * interp_rate)
-        burst = burst * np.exp(1j * radians * np.arange(len(burst)))
+            integer_offset_hz = (center - center_offset) * 15e3
+            radians = 2 * np.pi * integer_offset_hz / (file_sample_rate * interp_rate)
+            burst = burst * np.exp(1j * radians * np.arange(len(burst)))
 
-        # Downsample back to original rate
-        burst = resample_poly(burst, 1, interp_rate)
+            # Downsample back to original rate
+            burst = resample_poly(burst, 1, interp_rate)
 
         # --------------------------------------------------------------
         # Low-pass filter
         # --------------------------------------------------------------
-        burst = lfilter(filter_taps, [1.0], burst)
+        if not args.no_lpf:
+            burst = lfilter(filter_taps, [1.0], burst)
 
         # --------------------------------------------------------------
         # Symbol-timing offset (STO) correction via cyclic-prefix correlation
         # --------------------------------------------------------------
         interp_factor = 1   # set > 1 for sub-sample accuracy
         burst = resample_poly(burst, interp_factor, 1)
-        true_start = find_sto_cp(burst, file_sample_rate * interp_factor)
+        true_start = find_sto_cp(burst, file_sample_rate * interp_factor,
+                                  legacy=legacy)
         burst = resample_poly(burst[true_start:], 1, interp_factor)
 
         # --------------------------------------------------------------
         # Coarse carrier frequency offset (CFO) correction
-        # using the cyclic prefix of OFDM symbol 4 (first ZC symbol)
+        # using the cyclic prefix of the first ZC symbol
         # --------------------------------------------------------------
-        # zc_start (MATLAB 1-indexed value): last sample of CP4
-        zc_start_m = long_cp_len + fft_size * 3 + short_cp_len * 3
+        # MATLAB 1-indexed value: last sample of the first ZC's CP
+        zc_start_m = int(cp_schedule[:zc1_idx + 1].sum()) + fft_size * zc1_idx
 
         # Python slice equivalent of MATLAB burst(zc_start_m - short_cp_len : zc_start_m + fft_size - 1)
         # MATLAB arr(a:b) → Python arr[a-1 : b]
@@ -224,13 +244,36 @@ def main() -> None:
         burst = burst * np.exp(-1j * offset_radians * np.arange(1, len(burst) + 1))
 
         # --------------------------------------------------------------
+        # Sub-sample fine timing & constant-phase correction (DroneDetection-style)
+        # --------------------------------------------------------------
+        data_carrier_indices_pre = get_data_carrier_indices(file_sample_rate)
+        # DroneDetection searches ±15 LTE samples; scale by Fs/15.36e6 here.
+        scale = file_sample_rate / 15.36e6
+        if args.fine_timing:
+            sub_sample_offset = find_zc_offset(
+                burst, file_sample_rate, zc_idx=zc1_idx, zc_root=600,
+                data_carrier_indices=data_carrier_indices_pre,
+                search_range=15.0 * scale, n_steps=600, legacy=legacy)
+            if sub_sample_offset != 0.0:
+                print(f"  Sub-sample offset: {sub_sample_offset:+.4f}")
+                burst = with_sample_offset(burst, sub_sample_offset)
+
+        if args.fine_angle:
+            constant_phase = find_zc_angle(burst, file_sample_rate,
+                                            zc_idx=zc1_idx, legacy=legacy)
+            if constant_phase != 0.0:
+                burst = burst * np.exp(-1j * constant_phase)
+
+        # --------------------------------------------------------------
         # OFDM symbol extraction and channel estimation
         # --------------------------------------------------------------
-        time_domain_syms, freq_domain_syms = extract_ofdm_symbol_samples(burst, file_sample_rate)
+        time_domain_syms, freq_domain_syms = extract_ofdm_symbol_samples(
+            burst, file_sample_rate, legacy=legacy)
 
-        # ZC symbols are at indices 3 and 5 (0-based) = OFDM symbols 4 and 6
-        channel1 = calculate_channel(freq_domain_syms[3], file_sample_rate, 4)
-        channel2 = calculate_channel(freq_domain_syms[5], file_sample_rate, 6)
+        # ZC root selection (4 → root 600, 6 → root 147) is the same for
+        # modern and legacy; only the burst positions differ.
+        channel1 = calculate_channel(freq_domain_syms[zc1_idx], file_sample_rate, 4)
+        channel2 = calculate_channel(freq_domain_syms[zc2_idx], file_sample_rate, 6)
 
         channel1_data = channel1[data_carrier_indices]
         channel2_data = channel2[data_carrier_indices]
@@ -240,51 +283,54 @@ def main() -> None:
         # channel_phase_adj computed but not applied (matches MATLAB behaviour)
         _channel_phase_adj = (channel1_phase - channel2_phase) / 2  # noqa: F841
 
-        channel = channel1_data  # use first ZC for equalisation
-
-        # --------------------------------------------------------------
-        # QPSK demodulation over all 9 OFDM symbols
-        # --------------------------------------------------------------
-        bits_mat = np.zeros((9, 1200), dtype=np.int8)
-        for sym_idx in range(9):
-            dc = freq_domain_syms[sym_idx, data_carrier_indices]
-            if enable_equalizer:
-                dc = dc * channel
-            bits_mat[sym_idx] = quantize_qpsk(dc)
+        channel = channel1_data  # MATLAB behaviour: first ZC only
 
         if enable_plots:
             _plot_constellations(freq_domain_syms, data_carrier_indices, channel,
-                                 enable_equalizer, burst_idx + 1, _HERE)
+                                 enable_equalizer, burst_idx + 1, _HERE,
+                                 num_symbols=num_symbols)
 
         # --------------------------------------------------------------
-        # Descrambling
-        # Select data symbols (skip ZC symbols at indices 3,5 and skip index 0)
-        # MATLAB: bits([2,3,5,7,8,9],:) → 0-based: [1,2,4,6,7,8]
+        # QPSK demodulation + descramble + turbo, trying 4 phase rotations
+        # (DroneDetection-style — CRC selects the correct alignment)
         # --------------------------------------------------------------
         second_scrambler = generate_scrambler_seq(7200, scrambler_x2_init)
-        bits_mat = bits_mat[[1, 2, 4, 6, 7, 8], :]
-        bits = bits_mat.flatten().astype(np.int32)  # row-major = MATLAB reshape(bits.',1,[])
-        bits = np.bitwise_xor(bits, second_scrambler).astype(np.int8)
-
-        print(f"bits: {int(np.sum(bits == 1))} ones, "
-              f"{int(np.sum(bits == 0))} zeros (total {len(bits)})")
-
-        # --------------------------------------------------------------
-        # Turbo decoding via remove_turbo binary
-        # --------------------------------------------------------------
         bits_tmp = os.path.join(tempfile.gettempdir(), "droneid_bits")
-        bits.tofile(bits_tmp)
 
-        result = subprocess.run(
-            [turbo_decoder_path, bits_tmp],
-            capture_output=True, text=True)
+        burst_frame = ""
+        last_err = ""
+        for phase_idx in range(4):
+            phase_rot = np.exp(1j * np.pi / 2 * phase_idx)
 
-        if result.returncode != 0:
-            print(f"Warning: remove_turbo failed (exit {result.returncode}): "
-                  f"{result.stderr.strip()}")
-            frames.append("")
-        else:
-            frames.append(result.stdout)
+            bits_mat = np.zeros((num_symbols, 1200), dtype=np.int8)
+            for sym_idx in range(num_symbols):
+                dc = freq_domain_syms[sym_idx, data_carrier_indices]
+                if enable_equalizer:
+                    dc = dc * channel
+                bits_mat[sym_idx] = quantize_qpsk(dc * phase_rot)
+
+            bits_sel = bits_mat[data_symbol_indices, :]
+            bits = bits_sel.flatten().astype(np.int32)
+            bits = np.bitwise_xor(bits, second_scrambler).astype(np.int8)
+
+            bits.tofile(bits_tmp)
+            result = subprocess.run(
+                [turbo_decoder_path, bits_tmp],
+                capture_output=True, text=True)
+
+            if result.returncode == 0:
+                print(f"phase {phase_idx*90}°: {int(np.sum(bits == 1))} ones / "
+                      f"{int(np.sum(bits == 0))} zeros → CRC OK")
+                burst_frame = result.stdout
+                break
+            else:
+                last_err = result.stderr.strip()
+                print(f"phase {phase_idx*90}°: {int(np.sum(bits == 1))} ones / "
+                      f"{int(np.sum(bits == 0))} zeros → {last_err}")
+
+        if not burst_frame:
+            print(f"Warning: all 4 phase rotations failed for burst {burst_idx + 1}")
+        frames.append(burst_frame)
 
     # ------------------------------------------------------------------
     # Print decoded frames and parse to JSON
@@ -325,13 +371,22 @@ def _plot_time_spectrum(burst: np.ndarray, fs: float, idx: int) -> None:
 
 def _plot_constellations(freq_syms: np.ndarray, dc_idx: np.ndarray,
                           channel: np.ndarray, equalize: bool,
-                          burst_num: int, save_dir: str) -> None:
+                          burst_num: int, save_dir: str,
+                          num_symbols: int = 9) -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         return
-    fig, axes = plt.subplots(3, 3, num=1, figsize=(9, 9))
+    # Grid: 3x3 for modern (9), 2x4 for legacy (8)
+    if num_symbols <= 8:
+        rows, cols = 2, 4
+    else:
+        rows, cols = 3, 3
+    fig, axes = plt.subplots(rows, cols, num=1, figsize=(cols * 3, rows * 3))
     for sym_idx, ax in enumerate(axes.flat):
+        if sym_idx >= num_symbols:
+            ax.axis('off')
+            continue
         dc = freq_syms[sym_idx, dc_idx]
         if equalize:
             dc = dc * channel

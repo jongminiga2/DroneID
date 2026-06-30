@@ -435,3 +435,108 @@ def find_zc_indices_multi_freq(file_path: str, sample_rate: float,
         result[freq] = (np.unique(peaks) if peaks
                         else np.array([], dtype=int))
     return result
+
+
+def find_zc_indices_from_array(
+        iq_flat: np.ndarray,
+        sample_rate: float,
+        center_freq: float,
+        target_freqs_hz: Iterable[float],
+        correlation_threshold: float,
+) -> Dict[float, np.ndarray]:
+    """In-memory ZC search — 1 forward FFT shared across all frequencies.
+
+    Key properties:
+    - ONE sft.fft() of the full capture, shared by all N target frequencies.
+      Per-frequency cost is just one IFFT(N_dec) + one normalized_xcorr.
+      On memory-bandwidth-limited ARM this is significantly faster than
+      N × complex upfirdn (DDC approach).
+    - Sub-band IFFT is zero-phase (no group-delay correction needed).
+    - Signal at absolute frequency `freq` is at baseband bin (-kc) % N, NOT
+      bin +kc.  kc = round(f_shift / fs * N), k0 = (-kc) % N.
+
+    Args:
+        iq_flat: Flat int16 interleaved array (I0 Q0 I1 Q1 …).
+        sample_rate: Recording sample rate in Hz.
+        center_freq: SDR centre frequency in Hz.
+        target_freqs_hz: Absolute target frequencies in Hz.
+        correlation_threshold: |score|² threshold in [0, 1].
+
+    Returns:
+        dict mapping each target frequency (Hz) to a 1-D int array of
+        ZC peak positions in original-rate samples.
+    """
+    target_freqs_hz = list(target_freqs_hz)
+
+    # int16 interleaved → complex64
+    iq_complex = iq_flat.astype(np.float32).view(np.complex64)
+    if not iq_complex.flags['C_CONTIGUOUS']:
+        iq_complex = np.ascontiguousarray(iq_complex)
+    N = len(iq_complex)
+
+    dec_factor, decimated_fs = _resolve_decimation(sample_rate)
+    fft_size = get_fft_size(decimated_fs)
+    correlator_taps = create_zc(fft_size, 4).astype(np.complex64)
+    nfft = sft.next_fast_len(4 * len(correlator_taps), real=False)
+    H_conj, filter_var_sqrt = _precompute_filter_fft(correlator_taps, nfft)
+
+    freq_to_peaks: Dict[float, List[int]] = {f: [] for f in target_freqs_hz}
+
+    if dec_factor > 1:
+        N_dec    = N // dec_factor
+        half_dec = N_dec // 2
+
+        # Single forward FFT — the only O(N log N) step for the full-rate data.
+        X = sft.fft(iq_complex, workers=-1)
+
+        for freq in target_freqs_hz:
+            f_shift = center_freq - freq
+            # In baseband the signal is at -f_shift → FFT bin (-kc) % N.
+            kc = int(round(f_shift / sample_rate * N))
+            k0 = (-kc) % N
+
+            # Assemble N_dec-point sub-band in standard FFT order so that
+            # IFFT places the target at DC with no residual phase ramp.
+            X_sub = np.empty(N_dec, dtype=np.complex64)
+            ps, pe = k0, k0 + half_dec       # positive-freq half of sub-band
+            ns, ne = k0 - half_dec, k0       # negative-freq half
+
+            if pe <= N and ns >= 0:          # common: no wrap
+                X_sub[:half_dec] = X[ps:pe]
+                X_sub[half_dec:] = X[ns:ne]
+            else:                            # rare: near ±Nyquist
+                X_sub[:half_dec] = X[np.arange(ps, pe) % N]
+                X_sub[half_dec:] = X[np.arange(ns, ne) % N]
+
+            decimated = sft.ifft(X_sub, workers=-1).astype(np.complex64)
+
+            with sft.set_workers(-1):
+                scores = normalized_xcorr_fast(
+                    decimated, correlator_taps,
+                    filt_fft=H_conj, filter_var_sqrt=filter_var_sqrt,
+                    nfft=nfft)
+            abs_sq = np.abs(scores) ** 2
+            for dec_peak in _peaks_from_scores(abs_sq, correlation_threshold):
+                abs_peak = dec_peak * dec_factor   # zero-phase: no delay offset
+                if 0 <= abs_peak < N:
+                    freq_to_peaks[freq].append(abs_peak)
+    else:
+        # No decimation — explicit per-frequency shift, same ZC reference.
+        n_arange = np.arange(N, dtype=np.float64)
+        for freq in target_freqs_hz:
+            rot = np.exp(1j * np.pi * 2.0 * (center_freq - freq) / sample_rate
+                         * n_arange).astype(np.complex64)
+            with sft.set_workers(-1):
+                scores = normalized_xcorr_fast(
+                    iq_complex * rot, correlator_taps,
+                    filt_fft=H_conj, filter_var_sqrt=filter_var_sqrt,
+                    nfft=nfft)
+            abs_sq = np.abs(scores) ** 2
+            freq_to_peaks[freq].extend(
+                _peaks_from_scores(abs_sq, correlation_threshold))
+
+    result: Dict[float, np.ndarray] = {}
+    for freq in target_freqs_hz:
+        peaks = freq_to_peaks[freq]
+        result[freq] = np.unique(peaks) if peaks else np.array([], dtype=int)
+    return result

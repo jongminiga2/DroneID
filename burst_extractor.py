@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Iterable
 from utils import (get_fft_size, get_frame_structure,
-                   get_sample_count_of_file, read_complex)
+                   get_sample_count_of_file, read_complex, _NUMPY_DTYPE)
 from correlator import find_zc_indices_by_file
 
 
@@ -71,6 +71,66 @@ def extract_bursts_at_indices(input_path: str, sample_rate: float,
         burst = read_complex(input_path, start, burst_sample_count,
                               sample_type)
         bursts[i, :] = burst * freq_offset_vec
+    return bursts
+
+
+def extract_bursts_from_array(iq_flat: np.ndarray,
+                               sample_rate: float,
+                               frequency_offset: float,
+                               indices: Iterable[int],
+                               padding: int,
+                               sample_type: str = 'int16',
+                               legacy: bool = False) -> np.ndarray:
+    """In-memory version of extract_bursts_at_indices — no file I/O.
+
+    Args:
+        iq_flat: Flat int16 interleaved array (I0 Q0 I1 Q1 …) from capture.
+        sample_rate: Recording sample rate in Hz.
+        frequency_offset: Frequency shift to apply (Hz) — centre_freq - target_freq.
+        indices: ZC peak sample offsets in original-rate samples.
+        padding: Extra samples before and after each burst.
+        sample_type: I/Q data type (used only for dtype conversion of iq_flat).
+        legacy: Use legacy 8-symbol frame layout.
+
+    Returns:
+        2-D complex array, shape (num_bursts, burst_sample_count).
+    """
+    structure = get_frame_structure(sample_rate, legacy=legacy)
+    cp_schedule = structure['cp_schedule']
+    num_symbols = structure['num_symbols']
+    zc1_idx = structure['zc_symbol_indices'][0]
+    fft_size = get_fft_size(sample_rate)
+
+    total_samples = len(iq_flat) // 2
+    freq_offset_constant = 1j * np.pi * 2.0 * (frequency_offset / sample_rate)
+    zc_seq_offset = int(cp_schedule[:zc1_idx + 1].sum()) + fft_size * zc1_idx
+    burst_sample_count = ((padding * 2) + int(cp_schedule.sum())
+                          + (fft_size * num_symbols))
+    freq_offset_vec = np.exp(freq_offset_constant *
+                              np.arange(1, burst_sample_count + 1))
+
+    dtype = _NUMPY_DTYPE.get(sample_type, np.int16)
+
+    valid_starts = []
+    for idx in indices:
+        actual_start = int(idx) - padding - zc_seq_offset
+        actual_end = actual_start + burst_sample_count
+        if actual_start < 0:
+            print(f'Warning: skipping burst at offset {idx} – start clipped')
+            continue
+        if actual_end > total_samples:
+            print(f'Warning: skipping burst at offset {idx} – end clipped')
+            continue
+        valid_starts.append(actual_start)
+
+    if not valid_starts:
+        return np.zeros((0, burst_sample_count), dtype=complex)
+
+    bursts = np.zeros((len(valid_starts), burst_sample_count), dtype=complex)
+    for i, start in enumerate(valid_starts):
+        raw = iq_flat[start * 2:(start + burst_sample_count) * 2].astype(np.float32)
+        burst = (raw[0::2] + 1j * raw[1::2]).astype(np.complex128)
+        bursts[i] = burst * freq_offset_vec
     return bursts
 
 

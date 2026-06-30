@@ -1,0 +1,31 @@
+#!/bin/bash
+# .19 (신규 보드) 부팅 자동기동 — v11 self-contained, leader 제외 (2026-06-24 사용자 지시).
+#
+# .101 rc.local과 차이:
+#  ① .19는 qdma 커널모듈이 부팅 시 미적재 → bringup_qdma.sh 사용
+#     (insmod qdma-pf.ko + dma 도구설치 + 큐 init + LNA + stream_pump.sh 까지 한 번에).
+#     .101은 모듈이 이미 있어 qdma_st.sh + stream_pump.sh 직접 호출.
+#  ② leader ai_leader/start_container.sh·drone_detect.sh 제외 — 우리 펌프와 QDMA 큐/AD9371
+#     프론트엔드 경합 시 DMA fail + 보드 크래시 발생(2026-06-24 실측). 우리 펌프 단독 소유.
+#  ③ kipco(이사님 ICD 수신기, 우리 UDP 타깃 127.0.0.1:5001)는 유지.
+#
+# 설치: sudo cp deploy/jetson/rc.local.19 /etc/rc.local && sudo chmod +x /etc/rc.local
+# 원복: sudo cp /etc/rc.local.bak-YYYYMMDD /etc/rc.local
+mkdir -p /home/bstarcom/v11/logs
+# QDMA 모듈+도구+큐+LNA+스트림펌프(nohup) 일괄 기동
+#bash /home/bstarcom/v11/bringup_qdma.sh 1 > /home/bstarcom/v11/logs/rc.local.pump.log 
+bash /home/bstarcom/v11/bringup_qdma.sh 1 
+sleep 2
+# AI 추론 컨테이너(v11): /dev/shm 소비 + ICD UDP 송신(0x20C1 → 127.0.0.1:5001).
+#   run_drone_v11.sh가 docker rm -f 후 재기동이라 멱등(--restart 정책과 중복돼도 안전).
+bash /home/bstarcom/v11/run_drone_v11.sh > /home/bstarcom/v11/logs/rc.local.run.log 2>&1
+sleep 1
+# kipco = 이사님 ICD 수신기(UDP 5001) 유지.
+cp /home/bstarcom/kipco.out /home/bstarcom/kipco/kipco.out
+rm /home/bstarcom/kipco/rc.local.kipco.log
+/home/bstarcom/kipco/kipco.out > /home/bstarcom/kipco/rc.local.kipco.log 2>&1 &
+# 디코딩 ICD 송신기(0x20C0 → 127.0.0.1:5001): /dev/shm/droneid_detect.bin 폴링→재포장→UDP.
+#   ★count==0(=Versal 디코딩 미흐름)이면 자동 skip이라 미리 켜둬도 무해(2026-06-25).
+#   Versal이 탐지블록을 채우기 시작하면 추가 편집 없이 즉시 AI(0x20C1)와 나란히 송신.
+python3 /home/bstarcom/v11/patch/send_droneid_icd.py > /home/bstarcom/v11/logs/rc.local.droneid.log 2>&1 &
+exit 0
